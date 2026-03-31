@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
 
@@ -58,6 +59,9 @@ func (s *Server) RegisterHealthCheck() {
 			"status": "ready",
 		})
 	})
+
+	// Prometheus metrics endpoint
+	s.engine.GET("/metrics", gin.WrapH(promhttp.Handler()))
 }
 
 // RegisterRoute 注册路由

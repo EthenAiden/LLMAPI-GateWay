@@ -11,9 +11,25 @@ import (
 
 // RateLimiter implements distributed rate limiting using Redis Lua scripts
 type RateLimiter struct {
-	redis  *redis.Client
-	script *redis.Script
-	logger *zap.Logger
+	redis    *redis.Client
+	script   *redis.Script
+	logger   *zap.Logger
+	userCap  int
+	userRate float64
+	appCap   int
+	appRate  float64
+	modelCap int
+	modelRate float64
+}
+
+// RateLimiterConfig holds per-dimension rate limit configuration
+type RateLimiterConfig struct {
+	UserCapacity  int
+	UserRate      float64
+	AppCapacity   int
+	AppRate       float64
+	ModelCapacity int
+	ModelRate     float64
 }
 
 // Token bucket algorithm Lua script
@@ -50,12 +66,41 @@ end
 `
 
 // NewRateLimiter creates a new rate limiter
-func NewRateLimiter(redisClient *redis.Client, logger *zap.Logger) *RateLimiter {
-	return &RateLimiter{
-		redis:  redisClient,
-		script: redis.NewScript(tokenBucketScript),
-		logger: logger,
+func NewRateLimiter(redisClient *redis.Client, logger *zap.Logger, cfg ...RateLimiterConfig) *RateLimiter {
+	rl := &RateLimiter{
+		redis:     redisClient,
+		script:    redis.NewScript(tokenBucketScript),
+		logger:    logger,
+		// defaults
+		userCap:   10000,
+		userRate:  100,
+		appCap:    50000,
+		appRate:   500,
+		modelCap:  100000,
+		modelRate: 1000,
 	}
+	if len(cfg) > 0 {
+		c := cfg[0]
+		if c.UserCapacity > 0 {
+			rl.userCap = c.UserCapacity
+		}
+		if c.UserRate > 0 {
+			rl.userRate = c.UserRate
+		}
+		if c.AppCapacity > 0 {
+			rl.appCap = c.AppCapacity
+		}
+		if c.AppRate > 0 {
+			rl.appRate = c.AppRate
+		}
+		if c.ModelCapacity > 0 {
+			rl.modelCap = c.ModelCapacity
+		}
+		if c.ModelRate > 0 {
+			rl.modelRate = c.ModelRate
+		}
+	}
+	return rl
 }
 
 // AllowRequest checks if a request is allowed based on rate limit
@@ -88,9 +133,9 @@ func (rl *RateLimiter) AllowRequest(ctx context.Context, dimension RateLimitDime
 // CheckMultiDimension checks rate limits across multiple dimensions
 func (rl *RateLimiter) CheckMultiDimension(ctx context.Context, userID, appID, modelID string, tokens int) error {
 	dimensions := []RateLimitDimension{
-		{Type: "user", Identifier: userID, Capacity: 10000, Rate: 100},
-		{Type: "app", Identifier: appID, Capacity: 50000, Rate: 500},
-		{Type: "model", Identifier: modelID, Capacity: 100000, Rate: 1000},
+		{Type: "user", Identifier: userID, Capacity: rl.userCap, Rate: rl.userRate},
+		{Type: "app", Identifier: appID, Capacity: rl.appCap, Rate: rl.appRate},
+		{Type: "model", Identifier: modelID, Capacity: rl.modelCap, Rate: rl.modelRate},
 	}
 
 	for _, dim := range dimensions {

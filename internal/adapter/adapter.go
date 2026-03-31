@@ -28,11 +28,17 @@ type ProtocolAdapter interface {
 
 // OpenAIRequest OpenAI 请求格式
 type OpenAIRequest struct {
-	Model       string    `json:"model"`
-	Messages    []Message `json:"messages"`
-	Temperature float64   `json:"temperature,omitempty"`
-	MaxTokens   int       `json:"max_tokens,omitempty"`
-	Stream      bool      `json:"stream,omitempty"`
+	Model         string         `json:"model"`
+	Messages      []Message      `json:"messages"`
+	Temperature   float64        `json:"temperature,omitempty"`
+	MaxTokens     int            `json:"max_tokens,omitempty"`
+	Stream        bool           `json:"stream,omitempty"`
+	StreamOptions *StreamOptions `json:"stream_options,omitempty"`
+}
+
+// StreamOptions controls SSE stream behavior
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // Message 消息格式
@@ -87,6 +93,7 @@ type OpenAIStreamChunk struct {
 	Created int64         `json:"created"`
 	Model   string        `json:"model"`
 	Choices []StreamDelta `json:"choices"`
+	Usage   *Usage        `json:"usage,omitempty"` // populated in the final chunk when stream_options.include_usage=true
 }
 
 // StreamDelta 流式增量

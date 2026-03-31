@@ -1,12 +1,31 @@
 package router
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
 	"go.uber.org/zap"
 )
+
+// providerProbeURLs maps provider to its chat completions endpoint
+var providerProbeURLs = map[ProviderType]string{
+	ProviderCursor:      "https://api.cursor.sh/v1/chat/completions",
+	ProviderKiro:        "https://api.kiro.ai/v1/messages",
+	ProviderAntigravity: "https://api.antigravity.ai/v1/chat/completions",
+}
+
+// minimalProbeBody is the smallest valid request body for probing
+var minimalProbeBody = map[string]interface{}{
+	"model": "probe",
+	"messages": []map[string]string{
+		{"role": "user", "content": "ping"},
+	},
+	"max_tokens": 1,
+}
 
 // HealthProbe performs health checks on API keys
 type HealthProbe struct {
@@ -68,16 +87,52 @@ func (p *HealthProbe) probeAll(ctx context.Context) {
 	})
 }
 
-// probeKey probes a single API key
+// probeKey probes a single API key by making a real HTTP request to the upstream
 func (p *HealthProbe) probeKey(ctx context.Context, apiKey *APIKeyConfig, provider ProviderType) bool {
-	// Simple health check - just verify the key format is valid
-	// In production, this would make actual API calls
 	if apiKey.Key == "" {
 		return false
 	}
 
+	probeURL, ok := providerProbeURLs[provider]
+	if !ok {
+		p.logger.Warn("unknown provider for health probe", zap.String("provider", string(provider)))
+		return false
+	}
+
+	bodyBytes, err := json.Marshal(minimalProbeBody)
+	if err != nil {
+		return false
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, p.httpClient.Timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodPost, probeURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey.Key))
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		p.logger.Debug("health probe request failed",
+			zap.String("provider", string(provider)),
+			zap.String("key", maskKey(apiKey.Key)),
+			zap.Error(err))
+		return false
+	}
+	defer resp.Body.Close()
+
+	// 401/403 means key is invalid; 429 means key is alive but rate-limited (treat as healthy)
+	// 5xx means upstream is down
+	alive := resp.StatusCode != http.StatusInternalServerError &&
+		resp.StatusCode != http.StatusBadGateway &&
+		resp.StatusCode != http.StatusServiceUnavailable &&
+		resp.StatusCode != http.StatusGatewayTimeout
+
 	apiKey.LastCheck = time.Now()
-	return true
+	return alive
 }
 
 // MarkKeyFailed marks an API key as failed

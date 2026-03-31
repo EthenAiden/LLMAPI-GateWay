@@ -16,6 +16,7 @@ import (
 	"ai-ide-gateway/internal/handler"
 	"ai-ide-gateway/internal/logger"
 	"ai-ide-gateway/internal/monitor"
+	"ai-ide-gateway/internal/proxy"
 	"ai-ide-gateway/internal/quota"
 	"ai-ide-gateway/internal/replay"
 	"ai-ide-gateway/internal/router"
@@ -56,17 +57,6 @@ func main() {
 	}
 	defer redisClient.Close()
 
-	// 初始化 Kafka 生产者
-	kafkaProducer, err := storage.NewKafkaProducer(
-		cfg.Kafka.Brokers,
-		cfg.Kafka.Topic,
-		cfg.Kafka.Compression,
-		log,
-	)
-	if err != nil {
-		log.Fatal("failed to initialize Kafka producer", zap.Error(err))
-	}
-	defer kafkaProducer.Close()
 
 	// 初始化 PostgreSQL 客户端
 	postgresClient, err := storage.NewPostgresClient(
@@ -120,11 +110,22 @@ func main() {
 	// 4. 故障切换执行器
 	failoverExecutor := router.NewFailoverExecutor(routeManager, circuitBreaker, log)
 
+	// 启动健康探活（在后台 goroutine 中运行）
+	healthProbe := router.NewHealthProbe(routeManager, cfg.CircuitBreaker.HalfOpenTimeout, log)
+	go healthProbe.Start(context.Background())
+
 	// 5. 协议适配器工厂
 	adapterFactory := adapter.NewAdapterFactory()
 
 	// 6. 限流器
-	rateLimiter := breaker.NewRateLimiter(redisClient.GetClient(), log)
+	rateLimiter := breaker.NewRateLimiter(redisClient.GetClient(), log, breaker.RateLimiterConfig{
+		UserCapacity:  cfg.RateLimit.User.Capacity,
+		UserRate:      cfg.RateLimit.User.Rate,
+		AppCapacity:   cfg.RateLimit.App.Capacity,
+		AppRate:       cfg.RateLimit.App.Rate,
+		ModelCapacity: cfg.RateLimit.Model.Capacity,
+		ModelRate:     cfg.RateLimit.Model.Rate,
+	})
 
 	// 7. 配额管理器
 	quotaManager := quota.NewQuotaManager(redisClient.GetClient(), log)
@@ -136,7 +137,13 @@ func main() {
 	// 9. 监控指标
 	metrics := monitor.NewMetrics()
 
-	// 10. ChatHandler
+	// 10. SSE 流式代理（io.Pipe + goroutine，管理上游连接生命周期）
+	streamProxy := proxy.NewStreamProxy(log)
+	cleanupDone := make(chan struct{})
+	go streamProxy.StartCleanup(cleanupDone)
+	defer close(cleanupDone)
+
+	// 11. ChatHandler
 	chatHandler := handler.NewChatHandler(
 		authenticator,
 		routeManager,
@@ -146,11 +153,18 @@ func main() {
 		quotaManager,
 		replayCollector,
 		metrics,
+		streamProxy,
 		log,
 	)
 
 	// 注册 API 路由
 	httpServer.RegisterRoute(http.MethodPost, "/v1/chat/completions", chatHandler.Handle)
+
+	// 12. 流量回放服务
+	replayService := replay.NewReplayService(cfg.Kafka.Brokers, cfg.Kafka.Topic, log)
+	replayHandler := handler.NewReplayHandler(replayService, log)
+	httpServer.RegisterRoute(http.MethodGet, "/v1/replay/history", replayHandler.ListHistory)
+	httpServer.RegisterRoute(http.MethodPost, "/v1/replay/run", replayHandler.StartReplay)
 
 	// 启动 HTTP 服务器
 	if err := httpServer.Start(); err != nil {

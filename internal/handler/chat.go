@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -14,6 +13,7 @@ import (
 	"ai-ide-gateway/internal/auth"
 	"ai-ide-gateway/internal/breaker"
 	"ai-ide-gateway/internal/monitor"
+	"ai-ide-gateway/internal/proxy"
 	"ai-ide-gateway/internal/quota"
 	"ai-ide-gateway/internal/replay"
 	"ai-ide-gateway/internal/router"
@@ -23,7 +23,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// ChatHandler ???? /v1/chat/completions ???????? Handler
+// ChatHandler  /v1/chat/completions  Handler
 type ChatHandler struct {
 	authenticator   *auth.Authenticator
 	routeManager    *router.RouteManager
@@ -33,11 +33,12 @@ type ChatHandler struct {
 	quotaManager    *quota.QuotaManager
 	replayCollector *replay.ReplayCollector
 	metrics         *monitor.Metrics
+	streamProxy     *proxy.StreamProxy
 	httpClient      *http.Client
 	logger          *zap.Logger
 }
 
-// NewChatHandler ???? ChatHandler ????????????????
+// NewChatHandler  ChatHandler
 func NewChatHandler(
 	authenticator *auth.Authenticator,
 	routeManager *router.RouteManager,
@@ -47,6 +48,7 @@ func NewChatHandler(
 	quotaManager *quota.QuotaManager,
 	replayCollector *replay.ReplayCollector,
 	metrics *monitor.Metrics,
+	streamProxy *proxy.StreamProxy,
 	logger *zap.Logger,
 ) *ChatHandler {
 	return &ChatHandler{
@@ -58,6 +60,7 @@ func NewChatHandler(
 		quotaManager:    quotaManager,
 		replayCollector: replayCollector,
 		metrics:         metrics,
+		streamProxy:     streamProxy,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
@@ -65,12 +68,12 @@ func NewChatHandler(
 	}
 }
 
-// Handle ??????????????????? OpenAI ????? /v1/chat/completions ???
+// Handle  OpenAI  /v1/chat/completions
 func (h *ChatHandler) Handle(c *gin.Context) {
 	startTime := time.Now()
 	requestID := uuid.New().String()
 
-	// 1. ??????? Authorization Header ???????? API Key
+	// 1.  Authorization Header  API Key
 	authCtx, err := h.authenticator.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
 	if err != nil {
 		h.logger.Warn("authentication failed", zap.String("request_id", requestID), zap.Error(err))
@@ -78,14 +81,14 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 		return
 	}
 
-	// 2. ???? OpenAI ?????????
+	// 2.  OpenAI
 	var req adapter.OpenAIRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid request body: %v", err)})
 		return
 	}
 
-	// 3. ??????ï“???/???/????????
+	// 3. //
 	if err := h.rateLimiter.CheckMultiDimension(c.Request.Context(),
 		authCtx.UserID, authCtx.AppID, req.Model, 1); err != nil {
 		h.metrics.RateLimitExceeded.Inc()
@@ -93,21 +96,21 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 		return
 	}
 
-	// 4. ???¡¤???????????? Provider ????
+	// 4.  Provider
 	rule, err := h.routeManager.GetRule(req.Model)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("model not found: %s", req.Model)})
 		return
 	}
 
-	// 5. ???§¿??????????router.ProviderType ?? adapter.ProviderType ?????????
+	// 5. router.ProviderType  adapter.ProviderType
 	adpt, err := h.adapterFactory.GetAdapter(adapter.ProviderType(rule.Provider))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "adapter not found"})
 		return
 	}
 
-	// 6. ????????? vs ?????
+	// 6.  vs
 	if req.Stream {
 		h.handleStream(c, requestID, startTime, authCtx, &req, adpt, rule)
 	} else {
@@ -115,7 +118,7 @@ func (h *ChatHandler) Handle(c *gin.Context) {
 	}
 }
 
-// handleNonStream ???????????????? ?? ??? ?? ????? OpenAI ??? ?? ?????? ?? ??????????
+// handleNonStream      OpenAI
 func (h *ChatHandler) handleNonStream(
 	c *gin.Context,
 	requestID string,
@@ -127,21 +130,21 @@ func (h *ChatHandler) handleNonStream(
 ) {
 	var openaiResp *adapter.OpenAIResponse
 
-	// ??? Failover ?????????? API Key???????????????§Ý?
+	//  Failover  API Key
 	err := h.failover.ExecuteWithFailover(c.Request.Context(), req.Model, func(apiKey string) error {
-		// ?????????
+		//
 		upstreamReq, err := adpt.ConvertRequest(c.Request.Context(), req)
 		if err != nil {
 			return fmt.Errorf("request conversion failed: %w", err)
 		}
 
-		// ???? HTTP ??????? API Key
+		//  HTTP  API Key
 		httpReq, err := buildHTTPRequest(c.Request.Context(), upstreamReq, apiKey)
 		if err != nil {
 			return err
 		}
 
-		// ????????????
+		//
 		resp, err := h.httpClient.Do(httpReq)
 		if err != nil {
 			return fmt.Errorf("upstream request failed: %w", err)
@@ -152,13 +155,13 @@ func (h *ChatHandler) handleNonStream(
 			return fmt.Errorf("upstream error: status %d", resp.StatusCode)
 		}
 
-		// ????????
+		//
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return fmt.Errorf("failed to read response: %w", err)
 		}
 
-		// ???? OpenAI ??????
+		//  OpenAI
 		openaiResp, err = adpt.ConvertResponse(c.Request.Context(), &adapter.UpstreamResponse{
 			StatusCode: resp.StatusCode,
 			Body:       body,
@@ -173,7 +176,7 @@ func (h *ChatHandler) handleNonStream(
 		return
 	}
 
-	// 7. ??? Token ???????????????
+	// 7.  Token
 	if openaiResp != nil {
 		totalTokens := int64(openaiResp.Usage.TotalTokens)
 		if err := h.quotaManager.DeductQuota(c.Request.Context(),
@@ -182,8 +185,13 @@ func (h *ChatHandler) handleNonStream(
 		}
 	}
 
-	// 8. ???????????????¡¤??????? IO??
+	// 8.  IO
 	if h.replayCollector != nil && openaiResp != nil {
+		promptJSON, _ := json.Marshal(req.Messages)
+		responseContent := ""
+		if len(openaiResp.Choices) > 0 {
+			responseContent = openaiResp.Choices[0].Message.Content
+		}
 		h.replayCollector.Collect(c.Request.Context(), &replay.RequestMetadata{
 			RequestID:  requestID,
 			Timestamp:  startTime,
@@ -191,6 +199,8 @@ func (h *ChatHandler) handleNonStream(
 			AppID:      authCtx.AppID,
 			ModelID:    req.Model,
 			Provider:   string(adpt.GetProviderType()),
+			Prompt:     string(promptJSON),
+			Response:   responseContent,
 			Latency:    time.Since(startTime).Milliseconds(),
 			StatusCode: http.StatusOK,
 			TokenUsage: replay.TokenUsage{
@@ -205,7 +215,7 @@ func (h *ChatHandler) handleNonStream(
 	c.JSON(http.StatusOK, openaiResp)
 }
 
-// handleStream ????????????????? ?? ??? SSE ?? ??????? Token ?? ??????
+// handleStream    SSE   Token
 func (h *ChatHandler) handleStream(
 	c *gin.Context,
 	requestID string,
@@ -217,19 +227,19 @@ func (h *ChatHandler) handleStream(
 ) {
 	ctx := c.Request.Context()
 
-	// ??????estimatedTokens = 0 ??????¦Ë?????????????§µ????
+	// estimatedTokens = 0
 	reservationID, err := h.quotaManager.ReserveQuota(ctx, authCtx.UserID, authCtx.AppID, req.Model, 0)
 	if err != nil {
 		c.JSON(http.StatusPaymentRequired, gin.H{"error": "quota reservation failed: " + err.Error()})
 		return
 	}
 
-	var (
-		finalPromptTokens     int
-		finalCompletionTokens int
-	)
+	// Request usage data in final SSE chunk so we get accurate prompt token counts
+	if req.StreamOptions == nil {
+		req.StreamOptions = &adapter.StreamOptions{IncludeUsage: true}
+	}
 
-	// ???? SSE Headers
+	//  SSE Headers
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")
@@ -240,6 +250,8 @@ func (h *ChatHandler) handleStream(
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming not supported"})
 		return
 	}
+
+	var streamResult proxy.StreamResult
 
 	streamErr := h.failover.ExecuteWithFailover(ctx, req.Model, func(apiKey string) error {
 		upstreamReq, err := adpt.ConvertRequest(ctx, req)
@@ -252,27 +264,28 @@ func (h *ChatHandler) handleStream(
 			return err
 		}
 
+		// Use a detached context for the upstream request so that client
+		// disconnect (ctx cancel) is handled by StreamProxy, not the http client.
 		resp, err := h.httpClient.Do(httpReq)
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		// Note: resp.Body is closed by ConnectionManager.Close() inside ProxyStream
 
-		// ???§Ø??????? SSE ???????????? Token
-		pt, ct, sErr := streamAndCountTokens(c.Writer, flusher, resp.Body, adpt, ctx)
-		finalPromptTokens = pt
-		finalCompletionTokens = ct
-		return sErr
+		sessionID := requestID + "-" + apiKey[:min(8, len(apiKey))]
+		streamResult, err = h.streamProxy.ProxyStream(ctx, c.Writer, flusher, resp, sessionID)
+		return err
 	})
 
-	// ??????/??????????? Token ?????????
-	actualTokens := int64(finalPromptTokens + finalCompletionTokens)
+	// / Token
+	actualTokens := int64(streamResult.PromptTokens + streamResult.CompletionTokens)
 	if settleErr := h.quotaManager.SettleQuota(ctx, reservationID, actualTokens); settleErr != nil {
 		h.logger.Warn("quota settle failed", zap.String("reservation_id", reservationID), zap.Error(settleErr))
 	}
 
-	// ?????????????
+	//
 	if h.replayCollector != nil {
+		promptJSON, _ := json.Marshal(req.Messages)
 		h.replayCollector.Collect(ctx, &replay.RequestMetadata{
 			RequestID:  requestID,
 			Timestamp:  startTime,
@@ -280,11 +293,12 @@ func (h *ChatHandler) handleStream(
 			AppID:      authCtx.AppID,
 			ModelID:    req.Model,
 			Provider:   string(adpt.GetProviderType()),
+			Prompt:     string(promptJSON),
 			Latency:    time.Since(startTime).Milliseconds(),
 			StatusCode: http.StatusOK,
 			TokenUsage: replay.TokenUsage{
-				PromptTokens:     finalPromptTokens,
-				CompletionTokens: finalCompletionTokens,
+				PromptTokens:     streamResult.PromptTokens,
+				CompletionTokens: streamResult.CompletionTokens,
 				TotalTokens:      int(actualTokens),
 			},
 		})
@@ -296,7 +310,15 @@ func (h *ChatHandler) handleStream(
 	h.metrics.RequestTotal.Inc()
 }
 
-// buildHTTPRequest ???? UpstreamRequest ???? *http.Request??????? API Key
+// min returns the smaller of a and b
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// buildHTTPRequest  UpstreamRequest  *http.Request API Key
 func buildHTTPRequest(ctx context.Context, upstreamReq *adapter.UpstreamRequest, apiKey string) (*http.Request, error) {
 	bodyBytes, err := json.Marshal(upstreamReq.Body)
 	if err != nil {
@@ -312,7 +334,7 @@ func buildHTTPRequest(ctx context.Context, upstreamReq *adapter.UpstreamRequest,
 		httpReq.Header.Set(k, v)
 	}
 
-	// ????????¦Ä???¨¹?????????? API Key??Cursor/Antigravity ??? Bearer Token??
+	//  API KeyCursor/Antigravity  Bearer Token
 	if httpReq.Header.Get("Authorization") == "" && apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
@@ -320,67 +342,3 @@ func buildHTTPRequest(ctx context.Context, upstreamReq *adapter.UpstreamRequest,
 	return httpReq, nil
 }
 
-// streamAndCountTokens ????????????? Token ?????
-func streamAndCountTokens(w http.ResponseWriter, flusher http.Flusher, body io.ReadCloser, adpt adapter.ProtocolAdapter, ctx context.Context) (int, int, error) {
-	var promptTokens, completionTokens int
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 1MB buffer
-
-	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			return promptTokens, completionTokens, ctx.Err()
-		default:
-		}
-
-		line := scanner.Bytes()
-
-		// SSE ?????data: {...}
-		if bytes.HasPrefix(line, []byte("data: ")) {
-			data := bytes.TrimPrefix(line, []byte("data: "))
-
-			// ??????????????
-			if bytes.Equal(data, []byte("[DONE]")) {
-				if _, err := fmt.Fprintf(w, "data: [DONE]\n\n"); err != nil {
-					return promptTokens, completionTokens, err
-				}
-				flusher.Flush()
-				break
-			}
-
-			// ???? JSON ?????
-			var chunk adapter.OpenAIStreamChunk
-			if err := json.Unmarshal(data, &chunk); err == nil {
-				// ??? completion tokens????? delta ??????? 1 token???????
-				for _, choice := range chunk.Choices {
-					if choice.Delta.Content != "" {
-						// ????????????/4 ???? token ??
-						tokens := len(choice.Delta.Content) / 4
-						if tokens == 0 {
-							tokens = 1
-						}
-						completionTokens += tokens
-					}
-				}
-			}
-
-			// ?????????
-			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
-				return promptTokens, completionTokens, err
-			}
-			flusher.Flush()
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return promptTokens, completionTokens, err
-	}
-
-	// ????? prompt tokens????????????? chunk ?? usage ??¦Ë????
-	// ????????????????????????????????????§ß???
-	if promptTokens == 0 {
-		promptTokens = 100 // ???????
-	}
-
-	return promptTokens, completionTokens, nil
-}

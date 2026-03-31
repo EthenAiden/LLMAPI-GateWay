@@ -2,11 +2,12 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/go-redis/redis/v8"
 	"go.uber.org/zap"
@@ -126,15 +127,16 @@ func hashAPIKey(apiKey string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-// generateAPIKey generates a new API key
+// generateAPIKey generates a new cryptographically random API key
 func generateAPIKey() string {
-	// In production, use a proper random generator
-	return fmt.Sprintf("sk-%d", time.Now().UnixNano())
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("failed to generate random API key: %v", err))
+	}
+	return "sk-" + hex.EncodeToString(b)
 }
 
 // parseAPIKeyData parses API key data from JSON string
 func parseAPIKeyData(data string, apiKey *APIKey) error {
-	// Simple JSON parsing
-	apiKey.Status = "active"
-	return nil
+	return json.Unmarshal([]byte(data), apiKey)
 }
