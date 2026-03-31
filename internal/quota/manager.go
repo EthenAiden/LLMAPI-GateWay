@@ -13,15 +13,123 @@ import (
 
 // QuotaManager manages token quotas
 type QuotaManager struct {
-	redis  *redis.Client
-	logger *zap.Logger
+	redis         *redis.Client
+	logger        *zap.Logger
+	deductScript  *redis.Script
+	reserveScript *redis.Script
+	settleScript  *redis.Script
 }
+
+// Lua script for atomic quota deduction
+const deductQuotaScript = `
+local user_key = KEYS[1]
+local app_key = KEYS[2]
+local model_key = KEYS[3]
+local tokens = tonumber(ARGV[1])
+
+-- Get current quotas
+local user_data = redis.call('HMGET', user_key, 'total', 'used')
+local app_data = redis.call('HMGET', app_key, 'total', 'used')
+local model_data = redis.call('HMGET', model_key, 'total', 'used')
+
+local user_total = tonumber(user_data[1]) or 0
+local user_used = tonumber(user_data[2]) or 0
+local app_total = tonumber(app_data[1]) or 0
+local app_used = tonumber(app_data[2]) or 0
+local model_total = tonumber(model_data[1]) or 0
+local model_used = tonumber(model_data[2]) or 0
+
+-- Check if sufficient quota
+if user_total - user_used < tokens then
+    return {err = "insufficient user quota"}
+end
+if app_total - app_used < tokens then
+    return {err = "insufficient app quota"}
+end
+if model_total - model_used < tokens then
+    return {err = "insufficient model quota"}
+end
+
+-- Deduct quota atomically
+redis.call('HINCRBY', user_key, 'used', tokens)
+redis.call('HINCRBY', app_key, 'used', tokens)
+redis.call('HINCRBY', model_key, 'used', tokens)
+
+return {ok = "success"}
+`
+
+// Lua script for atomic quota reservation
+const reserveQuotaScript = `
+local user_key = KEYS[1]
+local app_key = KEYS[2]
+local model_key = KEYS[3]
+local tokens = tonumber(ARGV[1])
+
+-- Get current quotas
+local user_data = redis.call('HMGET', user_key, 'total', 'used', 'reserved')
+local app_data = redis.call('HMGET', app_key, 'total', 'used', 'reserved')
+local model_data = redis.call('HMGET', model_key, 'total', 'used', 'reserved')
+
+local user_total = tonumber(user_data[1]) or 0
+local user_used = tonumber(user_data[2]) or 0
+local user_reserved = tonumber(user_data[3]) or 0
+local app_total = tonumber(app_data[1]) or 0
+local app_used = tonumber(app_data[2]) or 0
+local app_reserved = tonumber(app_data[3]) or 0
+local model_total = tonumber(model_data[1]) or 0
+local model_used = tonumber(model_data[2]) or 0
+local model_reserved = tonumber(model_data[3]) or 0
+
+-- Check if sufficient quota
+if user_total - user_used - user_reserved < tokens then
+    return {err = "insufficient user quota"}
+end
+if app_total - app_used - app_reserved < tokens then
+    return {err = "insufficient app quota"}
+end
+if model_total - model_used - model_reserved < tokens then
+    return {err = "insufficient model quota"}
+end
+
+-- Reserve quota atomically
+redis.call('HINCRBY', user_key, 'reserved', tokens)
+redis.call('HINCRBY', app_key, 'reserved', tokens)
+redis.call('HINCRBY', model_key, 'reserved', tokens)
+
+return {ok = "success"}
+`
+
+// Lua script for atomic quota settlement
+const settleQuotaScript = `
+local user_key = KEYS[1]
+local app_key = KEYS[2]
+local model_key = KEYS[3]
+local reserved_tokens = tonumber(ARGV[1])
+local actual_tokens = tonumber(ARGV[2])
+
+-- Calculate difference
+local diff = actual_tokens - reserved_tokens
+
+-- Update quotas atomically
+redis.call('HINCRBY', user_key, 'reserved', -reserved_tokens)
+redis.call('HINCRBY', app_key, 'reserved', -reserved_tokens)
+redis.call('HINCRBY', model_key, 'reserved', -reserved_tokens)
+
+redis.call('HINCRBY', user_key, 'used', actual_tokens)
+redis.call('HINCRBY', app_key, 'used', actual_tokens)
+redis.call('HINCRBY', model_key, 'used', actual_tokens)
+
+return {ok = "success"}
+`
 
 // NewQuotaManager creates a new quota manager
 func NewQuotaManager(redisClient *redis.Client, logger *zap.Logger) *QuotaManager {
 	return &QuotaManager{
-		redis:  redisClient,
-		logger: logger,
+		redis:         redisClient,
+		logger:        logger,
+		deductScript:  redis.NewScript(deductQuotaScript),
+		reserveScript: redis.NewScript(reserveQuotaScript),
+		settleScript:  redis.NewScript(settleQuotaScript),
 	}
 }
 
@@ -57,54 +165,29 @@ func (qm *QuotaManager) SetQuota(ctx context.Context, node *QuotaNode) error {
 	return qm.redis.Set(ctx, key, data, 0).Err()
 }
 
-// ReserveQuota reserves quota for a streaming request
+// ReserveQuota reserves quota for a streaming request using Lua script for atomicity
 func (qm *QuotaManager) ReserveQuota(ctx context.Context, userID, appID, modelID string, estimatedTokens int64) (string, error) {
 	reservationID := uuid.New().String()
 
-	// Check if quotas exist and have sufficient tokens
-	userQuota, err := qm.GetQuota(ctx, QuotaLevelUser, userID)
+	userKey := qm.buildKey(QuotaLevelUser, userID)
+	appKey := qm.buildKey(QuotaLevelApp, appID)
+	modelKey := qm.buildKey(QuotaLevelModel, modelID)
+
+	result, err := qm.reserveScript.Run(ctx, qm.redis,
+		[]string{userKey, appKey, modelKey},
+		estimatedTokens,
+	).Result()
+
 	if err != nil {
-		return "", fmt.Errorf("user quota not found: %v", err)
-	}
-
-	appQuota, err := qm.GetQuota(ctx, QuotaLevelApp, appID)
-	if err != nil {
-		return "", fmt.Errorf("app quota not found: %v", err)
-	}
-
-	modelQuota, err := qm.GetQuota(ctx, QuotaLevelModel, modelID)
-	if err != nil {
-		return "", fmt.Errorf("model quota not found: %v", err)
-	}
-
-	// Check if sufficient quota available
-	if userQuota.Total-userQuota.Used-userQuota.Reserved < estimatedTokens {
-		return "", fmt.Errorf("insufficient user quota")
-	}
-
-	if appQuota.Total-appQuota.Used-appQuota.Reserved < estimatedTokens {
-		return "", fmt.Errorf("insufficient app quota")
-	}
-
-	if modelQuota.Total-modelQuota.Used-modelQuota.Reserved < estimatedTokens {
-		return "", fmt.Errorf("insufficient model quota")
-	}
-
-	// Reserve quota
-	userQuota.Reserved += estimatedTokens
-	appQuota.Reserved += estimatedTokens
-	modelQuota.Reserved += estimatedTokens
-
-	if err := qm.SetQuota(ctx, userQuota); err != nil {
+		qm.logger.Error("quota reservation failed", zap.Error(err))
 		return "", err
 	}
 
-	if err := qm.SetQuota(ctx, appQuota); err != nil {
-		return "", err
-	}
-
-	if err := qm.SetQuota(ctx, modelQuota); err != nil {
-		return "", err
+	// Check result
+	if resultMap, ok := result.(map[interface{}]interface{}); ok {
+		if errMsg, exists := resultMap["err"]; exists {
+			return "", fmt.Errorf("%v", errMsg)
+		}
 	}
 
 	// Record reservation
@@ -129,7 +212,7 @@ func (qm *QuotaManager) ReserveQuota(ctx context.Context, userID, appID, modelID
 	return reservationID, nil
 }
 
-// SettleQuota settles quota after streaming request completes
+// SettleQuota settles quota after streaming request completes using Lua script for atomicity
 func (qm *QuotaManager) SettleQuota(ctx context.Context, reservationID string, actualTokens int64) error {
 	// Get reservation
 	data, err := qm.redis.Get(ctx, fmt.Sprintf("reservation:%s", reservationID)).Result()
@@ -142,23 +225,25 @@ func (qm *QuotaManager) SettleQuota(ctx context.Context, reservationID string, a
 		return err
 	}
 
-	// Get quotas
-	userQuota, _ := qm.GetQuota(ctx, QuotaLevelUser, reservation.UserID)
-	appQuota, _ := qm.GetQuota(ctx, QuotaLevelApp, reservation.AppID)
-	modelQuota, _ := qm.GetQuota(ctx, QuotaLevelModel, reservation.ModelID)
+	userKey := qm.buildKey(QuotaLevelUser, reservation.UserID)
+	appKey := qm.buildKey(QuotaLevelApp, reservation.AppID)
+	modelKey := qm.buildKey(QuotaLevelModel, reservation.ModelID)
 
-	// Calculate difference
-	diff := actualTokens - reservation.ReservedTokens
+	result, err := qm.settleScript.Run(ctx, qm.redis,
+		[]string{userKey, appKey, modelKey},
+		reservation.ReservedTokens,
+		actualTokens,
+	).Result()
 
-	if diff > 0 {
-		// Need to deduct additional tokens
-		if err := qm.deductAdditional(ctx, userQuota, appQuota, modelQuota, diff); err != nil {
-			return err
-		}
-	} else if diff < 0 {
-		// Need to refund tokens
-		if err := qm.refund(ctx, userQuota, appQuota, modelQuota, -diff); err != nil {
-			return err
+	if err != nil {
+		qm.logger.Error("quota settlement failed", zap.Error(err))
+		return err
+	}
+
+	// Check result
+	if resultMap, ok := result.(map[interface{}]interface{}); ok {
+		if errMsg, exists := resultMap["err"]; exists {
+			return fmt.Errorf("%v", errMsg)
 		}
 	}
 
@@ -171,6 +256,7 @@ func (qm *QuotaManager) SettleQuota(ctx context.Context, reservationID string, a
 	reservationData, _ := json.Marshal(reservation)
 	qm.redis.Set(ctx, fmt.Sprintf("reservation:%s", reservationID), reservationData, 10*time.Minute)
 
+	diff := actualTokens - reservation.ReservedTokens
 	qm.logger.Info("quota settled",
 		zap.String("reservation_id", reservationID),
 		zap.Int64("actual_tokens", actualTokens),
@@ -179,51 +265,27 @@ func (qm *QuotaManager) SettleQuota(ctx context.Context, reservationID string, a
 	return nil
 }
 
-// DeductQuota deducts quota for non-streaming requests
+// DeductQuota deducts quota for non-streaming requests using Lua script for atomicity
 func (qm *QuotaManager) DeductQuota(ctx context.Context, userID, appID, modelID string, tokens int64) error {
-	userQuota, err := qm.GetQuota(ctx, QuotaLevelUser, userID)
+	userKey := qm.buildKey(QuotaLevelUser, userID)
+	appKey := qm.buildKey(QuotaLevelApp, appID)
+	modelKey := qm.buildKey(QuotaLevelModel, modelID)
+
+	result, err := qm.deductScript.Run(ctx, qm.redis,
+		[]string{userKey, appKey, modelKey},
+		tokens,
+	).Result()
+
 	if err != nil {
+		qm.logger.Error("quota deduction failed", zap.Error(err))
 		return err
 	}
 
-	appQuota, err := qm.GetQuota(ctx, QuotaLevelApp, appID)
-	if err != nil {
-		return err
-	}
-
-	modelQuota, err := qm.GetQuota(ctx, QuotaLevelModel, modelID)
-	if err != nil {
-		return err
-	}
-
-	// Check if sufficient quota
-	if userQuota.Total-userQuota.Used < tokens {
-		return fmt.Errorf("insufficient user quota")
-	}
-
-	if appQuota.Total-appQuota.Used < tokens {
-		return fmt.Errorf("insufficient app quota")
-	}
-
-	if modelQuota.Total-modelQuota.Used < tokens {
-		return fmt.Errorf("insufficient model quota")
-	}
-
-	// Deduct quota
-	userQuota.Used += tokens
-	appQuota.Used += tokens
-	modelQuota.Used += tokens
-
-	if err := qm.SetQuota(ctx, userQuota); err != nil {
-		return err
-	}
-
-	if err := qm.SetQuota(ctx, appQuota); err != nil {
-		return err
-	}
-
-	if err := qm.SetQuota(ctx, modelQuota); err != nil {
-		return err
+	// Check result
+	if resultMap, ok := result.(map[interface{}]interface{}); ok {
+		if errMsg, exists := resultMap["err"]; exists {
+			return fmt.Errorf("%v", errMsg)
+		}
 	}
 
 	qm.logger.Info("quota deducted",
@@ -233,43 +295,6 @@ func (qm *QuotaManager) DeductQuota(ctx context.Context, userID, appID, modelID 
 		zap.Int64("tokens", tokens))
 
 	return nil
-}
-
-// deductAdditional deducts additional tokens
-func (qm *QuotaManager) deductAdditional(ctx context.Context, userQuota, appQuota, modelQuota *QuotaNode, tokens int64) error {
-	userQuota.Reserved -= tokens
-	userQuota.Used += tokens
-	appQuota.Reserved -= tokens
-	appQuota.Used += tokens
-	modelQuota.Reserved -= tokens
-	modelQuota.Used += tokens
-
-	if err := qm.SetQuota(ctx, userQuota); err != nil {
-		return err
-	}
-
-	if err := qm.SetQuota(ctx, appQuota); err != nil {
-		return err
-	}
-
-	return qm.SetQuota(ctx, modelQuota)
-}
-
-// refund refunds tokens
-func (qm *QuotaManager) refund(ctx context.Context, userQuota, appQuota, modelQuota *QuotaNode, tokens int64) error {
-	userQuota.Reserved -= tokens
-	appQuota.Reserved -= tokens
-	modelQuota.Reserved -= tokens
-
-	if err := qm.SetQuota(ctx, userQuota); err != nil {
-		return err
-	}
-
-	if err := qm.SetQuota(ctx, appQuota); err != nil {
-		return err
-	}
-
-	return qm.SetQuota(ctx, modelQuota)
 }
 
 // buildKey builds the Redis key for a quota node

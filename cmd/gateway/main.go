@@ -3,13 +3,22 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"ai-ide-gateway/internal/adapter"
+	"ai-ide-gateway/internal/auth"
+	"ai-ide-gateway/internal/breaker"
 	"ai-ide-gateway/internal/config"
+	"ai-ide-gateway/internal/handler"
 	"ai-ide-gateway/internal/logger"
+	"ai-ide-gateway/internal/monitor"
+	"ai-ide-gateway/internal/quota"
+	"ai-ide-gateway/internal/replay"
+	"ai-ide-gateway/internal/router"
 	"ai-ide-gateway/internal/server"
 	"ai-ide-gateway/internal/storage"
 
@@ -86,6 +95,62 @@ func main() {
 
 	// 注册健康检查端点
 	httpServer.RegisterHealthCheck()
+
+	// 初始化依赖组件
+	// 1. 认证器
+	authenticator := auth.NewAuthenticator(redisClient.GetClient(), log)
+
+	// 2. 路由管理器
+	routeManager := router.NewRouteManager(redisClient.GetClient(), log)
+	if err := routeManager.LoadRules(context.Background()); err != nil {
+		log.Warn("failed to load route rules", zap.Error(err))
+	}
+	if err := routeManager.SubscribeUpdates(context.Background()); err != nil {
+		log.Warn("failed to subscribe route updates", zap.Error(err))
+	}
+
+	// 3. 熔断器
+	circuitBreaker := breaker.NewCircuitBreaker(breaker.CircuitBreakerConfig{
+		WindowSize:      cfg.CircuitBreaker.WindowSize,
+		ErrorThreshold:  cfg.CircuitBreaker.ErrorThreshold,
+		HalfOpenTimeout: cfg.CircuitBreaker.HalfOpenTimeout,
+		MaxRequests:     10,
+	}, log)
+
+	// 4. 故障切换执行器
+	failoverExecutor := router.NewFailoverExecutor(routeManager, circuitBreaker, log)
+
+	// 5. 协议适配器工厂
+	adapterFactory := adapter.NewAdapterFactory()
+
+	// 6. 限流器
+	rateLimiter := breaker.NewRateLimiter(redisClient.GetClient(), log)
+
+	// 7. 配额管理器
+	quotaManager := quota.NewQuotaManager(redisClient.GetClient(), log)
+
+	// 8. 回放收集器
+	replayCollector := replay.NewReplayCollector(cfg.Kafka.Brokers, cfg.Kafka.Topic, log)
+	defer replayCollector.Close()
+
+	// 9. 监控指标
+	metrics := monitor.NewMetrics()
+
+	// 10. ChatHandler
+	chatHandler := handler.NewChatHandler(
+		authenticator,
+		routeManager,
+		failoverExecutor,
+		adapterFactory,
+		rateLimiter,
+		quotaManager,
+		replayCollector,
+		metrics,
+		log,
+	)
+
+	// 注册 API 路由
+	httpServer.RegisterRoute(http.MethodPost, "/v1/chat/completions", chatHandler.Handle)
 
 	// 启动 HTTP 服务器
 	if err := httpServer.Start(); err != nil {
